@@ -1,5 +1,4 @@
 
-```javascript
 import { connect } from 'cloudflare:sockets';
 
 // ==================== 配置 ====================
