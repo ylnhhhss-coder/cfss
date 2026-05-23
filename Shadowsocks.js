@@ -1,4 +1,3 @@
-以下是修正后的 Cloudflare Worker 代码。主要修正了 Shadowsocks 2022 协议中 header 长度字段的偏移计算错误，并修正了 header 第一个字节的校验值。
 
 ```javascript
 import { connect } from 'cloudflare:sockets';
@@ -667,7 +666,7 @@ class SS {
     return r;
   }
 }
-    // 修正：根据 shadowsocks 2022 规范，第一个字节应为 1
+    
       if (fh[0] !== 1) return { c: [], e: 'type' };
       const vl = u16be(fh, 9);
       const vhs = vl + I.tag;
