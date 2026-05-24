@@ -3,7 +3,7 @@ import { connect } from 'cloudflare:sockets';
 const CFG = {
   pw: 'test123',
   method: 'aes-256-gcm',
-  proxyIP: '',
+  proxyIP: 'ProxyIP.HK.CMLiussss.net',
   maxChunk: 0x3fff
 };
 
