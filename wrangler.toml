@@ -2,5 +2,5 @@ name = "cfss"
 main = "Shadowsocks.js"
 compatibility_date = "2025-04-07"
 
-account_id = "5769086c99be083c06457a3e098d3dba"
+account_id = "b6843cab65b4ec77d983470f5f852bb8"
 workers_dev = true
