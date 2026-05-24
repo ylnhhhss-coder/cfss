@@ -1,304 +1,144 @@
 import { connect } from 'cloudflare:sockets';
-
-const CFG = {
-  pw: 'test123',
-  psk: 'YWJjZGVmZ2hpamtsbW5vcA==',
-  method: 'aes-256-gcm'
+const uuid = '5b75df69-62e0-4f8d-82f4-c4763c6a9ec3', maxED = 8192;
+export default { fetch: req => req.headers.get('Upgrade') === 'websocket' ? ws(req) : new Response('ok') };
+const idB = Uint8Array.fromHex(uuid.replaceAll('-', '')), dec = new TextDecoder(), enc = s => new TextEncoder().encode(s);
+const u16 = (b, o = 0) => (b[o] << 8) | b[o + 1], pad4 = n => -n & 3;
+const checkUUID = c => !idB.some((v, i) => c[i + 1] !== v);
+const addr = (t, b) => t === 3 ? dec.decode(b) : t === 1 ? b.join('.') : t === 4 ? `[${Array.from({ length: 8 }, (_, i) => u16(b, i * 2).toString(16)).join(':')}]` : '';
+const parseAddr = (b, o, t) => { const l = t === 3 ? b[o++] : t === 1 ? 4 : t === 4 ? 16 : 0; return l && o + l <= b.length ? { addrBytes: b.subarray(o, o + l), dataOffset: o + l } : null; };
+const vless = c => { if (!checkUUID(c)) return null; const o = 19 + c[17], t = c[o + 2] === 1 ? 1 : c[o + 2] + 1, a = parseAddr(c, o + 3, t); return a ? { addrType: t, ...a, port: u16(c, o) } : null; };
+const vlessUDP = c => checkUUID(c) && c[18 + c[17]] === 3 ? { cmd: 3, dataOffset: 19 + c[17] } : null;
+const relay = async (rd, send, close) => { try { for (;;) { const { done, value } = await rd.read(); if (done) break; value?.byteLength && send(value); } } catch {} finally { rd.releaseLock(); close(); } };
+const MAGIC = new Uint8Array([0x21, 0x12, 0xA4, 0x42]);
+const MT = { AQ: 0x003, AO: 0x103, AE: 0x113, PQ: 0x008, PO: 0x108, CQ: 0x00A, CO: 0x10A, BQ: 0x00B, BO: 0x10B, SI: 0x016, DI: 0x017 };
+const AT = { USER: 0x006, MI: 0x008, ERR: 0x009, PEER: 0x012, DATA: 0x013, REALM: 0x014, NONCE: 0x015, TRANSPORT: 0x019, CONNID: 0x02A };
+const cat = (...a) => { const r = new Uint8Array(a.reduce((s, x) => s + x.length, 0)); a.reduce((o, x) => (r.set(x, o), o + x.length), 0); return r; };
+const safeClose = (...a) => a.forEach(x => { try { x?.close?.(); } catch {} });
+const dial = async (h, p) => { const s = connect({ hostname: h, port: p }); await s.opened; return s; };
+const tid = () => crypto.getRandomValues(new Uint8Array(12));
+const stunAttr = (t, v) => { const b = new Uint8Array(4 + v.length + pad4(v.length)), d = new DataView(b.buffer); d.setUint16(0, t); d.setUint16(2, v.length); b.set(v, 4); return b; };
+const stunMsg = (t, id, a) => { const bd = cat(...a), h = new Uint8Array(20), d = new DataView(h.buffer); d.setUint16(0, t); d.setUint16(2, bd.length); h.set(MAGIC, 4); h.set(id, 8); return cat(h, bd); };
+const xorPeer = (ip, port) => { const b = new Uint8Array(8); b[1] = 1; new DataView(b.buffer).setUint16(2, port ^ 0x2112); ip.split('.').forEach((v, i) => b[4 + i] = +v ^ MAGIC[i]); return b; };
+const parseStun = d => {
+  if (d.length < 20 || MAGIC.some((v, i) => d[4 + i] !== v)) return null;
+  const dv = new DataView(d.buffer, d.byteOffset, d.byteLength), ml = dv.getUint16(2), attrs = {};
+  for (let o = 20; o + 4 <= 20 + ml; ) { const t = dv.getUint16(o), l = dv.getUint16(o + 2); if (o + 4 + l > d.length) break; attrs[t] = d.slice(o + 4, o + 4 + l); o += 4 + l + pad4(l); }
+  return { type: dv.getUint16(0), attrs };
 };
-
-// ==================== 模式定义（模式名字清晰） ====================
-const MODES = {
-  daily: {
-    name: "日常模式",           // ← 模式名字
-    maxChunk: 0x3fff,           // 16383 字节
-    useRandomIP: true
-  },
-  max: {
-    name: "最大模式",           // ← 模式名字
-    maxChunk: 0x7fff,           // 32767 字节
-    useRandomIP: false
-  }
+const parseErr = d => d?.length >= 4 ? (d[2] & 7) * 100 + d[3] : 0;
+const parseXorPeer = d => d?.length >= 8 ? [MAGIC.map((m, i) => d[4 + i] ^ m).join('.'), u16(d, 2) ^ 0x2112] : ['', 0];
+const addIntegrity = async (m, key) => { const c = new Uint8Array(m), d = new DataView(c.buffer); d.setUint16(2, d.getUint16(2) + 24); const k = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']); return cat(c, stunAttr(AT.MI, new Uint8Array(await crypto.subtle.sign('HMAC', k, c)))); };
+const readStun = async (rd, buf) => {
+  let b = buf ?? new Uint8Array(0); const pull = async () => { const { done, value } = await rd.read(); if (done) throw 0; b = cat(b, new Uint8Array(value)); };
+  try { while (b.length < 20) await pull(); const n = 20 + u16(b, 2); while (b.length < n) await pull();
+    return [parseStun(b.subarray(0, n)), b.length > n ? b.subarray(n) : null]; } catch { return [null, null]; }
 };
-
-const proxyIPs = [
-  '1.1.1.1',     // 默认优选IP列表
-  '8.8.8.8',
-  // '104.16.0.0', // 可继续添加
-];
-
-let currentMode = 'daily';
-let proxyIP = 'ProxyIP.HK.CMLiussss.net';
-// =====================================================
-
-const C = {
-  none: { k: 16, iv: 0, aead: 0, s: 0, none: 1 },
-  plain: { k: 16, iv: 0, aead: 0, s: 0, none: 1 },
-  'aes-128-gcm': { k: 16, iv: 16, aead: 1, tag: 16 },
-  'aes-192-gcm': { k: 24, iv: 24, aead: 1, tag: 16 },
-  'aes-256-gcm': { k: 32, iv: 32, aead: 1, tag: 16 },
-  'chacha20-ietf-poly1305': { k: 32, iv: 32, aead: 1, tag: 16, cc: 1 },
-  'xchacha20-ietf-poly1305': { k: 32, iv: 32, aead: 1, tag: 16, xc: 1 },
-  'chacha20-ietf': { k: 32, iv: 12, s: 1, st: 'cc' },
-  'xchacha20': { k: 32, iv: 24, s: 1, st: 'xc' },
-  'aes-128-ctr': { k: 16, iv: 16, s: 1, st: 'ctr' },
-  'aes-192-ctr': { k: 24, iv: 16, s: 1, st: 'ctr' },
-  'aes-256-ctr': { k: 32, iv: 16, s: 1, st: 'ctr' },
-  'aes-128-cfb': { k: 16, iv: 16, s: 1, st: 'cfb' },
-  'aes-192-cfb': { k: 24, iv: 16, s: 1, st: 'cfb' },
-  'aes-256-cfb': { k: 32, iv: 16, s: 1, st: 'cfb' },
-  'rc4-md5': { k: 16, iv: 16, s: 1, st: 'rc4' },
-  '2022-blake3-aes-128-gcm': { k: 16, iv: 16, aead: 1, tag: 16, b3: 1 },
-  '2022-blake3-aes-256-gcm': { k: 32, iv: 32, aead: 1, tag: 16, b3: 1 },
-  '2022-blake3-chacha20-poly1305': { k: 32, iv: 32, aead: 1, tag: 16, b3: 1, cc: 1 }
+const resolveIP = async h => /^\d+\.\d+\.\d+\.\d+$/.test(h) ? h : (await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(h)}&type=A`, { headers: { Accept: 'application/dns-json' } }).then(r => r.json()).catch(() => ({}))).Answer?.find(a => a.type === 1)?.data ?? null;
+const md5 = async s => new Uint8Array(await crypto.subtle.digest('MD5', enc(s)));
+const turnAuth = async (w, r, transport, { user, pass }, pipeline) => {
+  const tp = new Uint8Array([transport, 0, 0, 0]);
+  await w.write(stunMsg(MT.AQ, tid(), [stunAttr(AT.TRANSPORT, tp)]));
+  let [msg, ex] = await readStun(r); if (!msg) return null;
+  let key = null, aa = [];
+  const sign = m => key ? addIntegrity(m, key) : Promise.resolve(m);
+  if (msg.type === MT.AE && user && parseErr(msg.attrs[AT.ERR]) === 401) {
+    const realm = dec.decode(msg.attrs[AT.REALM] ?? new Uint8Array(0)), nonce = msg.attrs[AT.NONCE] ?? new Uint8Array(0);
+    key = await md5(`${user}:${realm}:${pass}`);
+    aa = [stunAttr(AT.USER, enc(user)), stunAttr(AT.REALM, enc(realm)), stunAttr(AT.NONCE, nonce)];
+    const aq = await addIntegrity(stunMsg(MT.AQ, tid(), [stunAttr(AT.TRANSPORT, tp), ...aa]), key);
+    const extras = pipeline ? await Promise.all(pipeline(aa, sign)) : [];
+    await w.write(extras.length ? cat(aq, ...extras) : aq);
+    [msg, ex] = await readStun(r, ex); if (!msg) return null;
+  } else if (pipeline && msg.type === MT.AO) {
+    const extras = await Promise.all(pipeline(aa, sign));
+    if (extras.length) await w.write(cat(...extras));
+  }
+  return msg.type === MT.AO ? { key, aa, ex, sign } : null;
 };
-
-const I = C[CFG.method];
-const enc = new TextEncoder();
-const dec = new TextDecoder();
-
-const evp = async (pw, kl) => {
-  const p = enc.encode(pw);
-  let k = new Uint8Array(0);
-  let pv = new Uint8Array(0);
-  while (k.length < kl) {
-    const d = new Uint8Array(pv.length + p.length);
-    d.set(pv); d.set(p, pv.length);
-    pv = new Uint8Array(await crypto.subtle.digest('MD5', d));
-    const nk = new Uint8Array(k.length + pv.length);
-    nk.set(k); nk.set(pv, k.length);
-    k = nk;
-  }
-  return k.slice(0, kl);
+const getTurn = url => { const m = decodeURIComponent(url).match(/\/turn:\/\/([^?&#\s]*)/i); if (!m) return null; const t = m[1], at = t.lastIndexOf('@'), cred = at >= 0 ? t.slice(0, at) : '', hp = t.slice(at + 1), [host, p] = hp.split(':'), ci = cred.indexOf(':'); return p ? { host, port: +p, user: ci >= 0 ? cred.slice(0, ci) : '', pass: ci >= 0 ? cred.slice(ci + 1) : '' } : null; };
+const encodeAddr = h => {
+  const s = h.replace(/^\[|\]$/g, ''), m = s.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (m) return new Uint8Array([0x01, ...m.slice(1).map(Number)]);
+  if (s.includes(':')) { const b = new Uint8Array(17); b[0] = 0x03; s.split(':').forEach((x, i) => { const v = parseInt(x, 16) || 0; b[1 + i * 2] = v >> 8; b[2 + i * 2] = v & 0xff; }); return b; }
+  const e = enc(h); return cat(new Uint8Array([0x02, e.length]), e);
 };
-
-const u16be = (d, o) => (d[o] << 8) | d[o + 1];
-const put16 = (d, o, v) => { d[o] = (v >> 8) & 255; d[o + 1] = v & 255; };
-
-const cat = (...xs) => {
-  const r = new Uint8Array(xs.reduce((n, x) => n + x.length, 0));
-  let o = 0;
-  for (const x of xs) { r.set(x, o); o += x.length; }
-  return r;
+const xudpAddr = d => {
+  if (!d.length) return ['', 0];
+  if (d[0] <= 1) return d.length >= 5 ? [d.subarray(1, 5).join('.'), 5] : ['', 0];
+  if (d[0] === 2) return d.length >= 2 + d[1] ? [dec.decode(d.subarray(2, 2 + d[1])), 2 + d[1]] : ['', 0];
+  return d[0] === 3 && d.length >= 17 ? [`[${Array.from({ length: 8 }, (_, i) => u16(d, 1 + i * 2).toString(16)).join(':')}]`, 17] : ['', 0];
 };
-
-const parseAddr = d => {
-  if (d.length < 1) return null;
-  const t = d[0];
-  if (t === 1) {
-    if (d.length < 7) return null;
-    return { h: `\( {d[1]}. \){d[2]}.\( {d[3]}. \){d[4]}`, p: u16be(d, 5), o: 7 };
-  } else if (t === 3) {
-    const l = d[1];
-    if (d.length < 4 + l) return null;
-    return { h: dec.decode(d.slice(2, 2 + l)), p: u16be(d, 2 + l), o: 4 + l };
-  } else if (t === 4) {
-    if (d.length < 19) return null;
-    const pts = [];
-    for (let i = 0; i < 8; i++) pts.push(((d[1 + i*2] << 8) | d[2 + i*2]).toString(16));
-    return { h: `[${pts.join(':')}]`, p: u16be(d, 17), o: 19 };
-  }
-  return null;
+const fakeIPType = h => { const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/); return m && +m[1] === 198 && [18, 19].includes(+m[2]) ? 4 : h.replace(/^\[|\]$/g, '').startsWith('fc') && h.includes(':') ? 6 : 0; };
+const parseXUDP = d => {
+  if (d.length < 6) return null;
+  const metaLen = u16(d), metaEnd = 2 + metaLen;
+  if (metaLen < 4 || metaEnd > d.length) return null;
+  const f = { network: metaEnd > 6 ? d[6] : 0, port: metaEnd >= 9 ? u16(d, 7) : 0, host: metaEnd > 9 ? xudpAddr(d.subarray(9, metaEnd))[0] : '', payload: null, totalLen: metaEnd };
+  if ((d[5] & 1) && metaEnd + 2 <= d.length) { const pLen = u16(d, metaEnd); if (metaEnd + 2 + pLen <= d.length) { f.payload = d.subarray(metaEnd + 2, metaEnd + 2 + pLen); f.totalLen = metaEnd + 2 + pLen; } }
+  return f;
 };
-
-class AEAD {
-  constructor(key) { this.key = key; this.nonce = new Uint8Array(12); this.ck = null; }
-  async init() {
-    this.ck = await crypto.subtle.importKey('raw', this.key, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-  }
-  inc() {
-    for (let i = 0; i < this.nonce.length; i++) {
-      this.nonce[i]++; if (this.nonce[i]) break;
-    }
-  }
-  async enc(d) {
-    const c = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: this.nonce, tagLength: 128 }, this.ck, d);
-    this.inc();
-    return new Uint8Array(c);
-  }
-  async dec(d) {
-    try {
-      const p = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: this.nonce, tagLength: 128 }, this.ck, d);
-      this.inc();
-      return new Uint8Array(p);
-    } catch { return null; }
-  }
-}
-
-class SS {
-  constructor() {
-    this.mk = null; this.enc = null; this.dec = null;
-    this.buf = new Uint8Array(0); this.plen = -1;
-  }
-  async init() { this.mk = await evp(CFG.pw, I.k); }
-
-  async decData(data) {
-    this.buf = cat(this.buf, data);
-    const out = [];
-    if (!this.dec) {
-      if (this.buf.length < I.iv) return { c: [] };
-      const salt = this.buf.slice(0, I.iv);
-      this.buf = this.buf.slice(I.iv);
-      this.dec = new AEAD(cat(this.mk, salt).slice(0, I.k));
-      await this.dec.init();
-    }
-    while (true) {
-      if (this.plen < 0) {
-        const ls = 2 + I.tag;
-        if (this.buf.length < ls) break;
-        const lp = await this.dec.dec(this.buf.slice(0, ls));
-        if (!lp) return { c: out, e: 'len' };
-        this.plen = u16be(lp, 0);
-        this.buf = this.buf.slice(ls);
-      }
-      const ps = this.plen + I.tag;
-      if (this.buf.length < ps) break;
-      const pp = await this.dec.dec(this.buf.slice(0, ps));
-      if (!pp) return { c: out, e: 'pay' };
-      out.push(pp);
-      this.buf = this.buf.slice(ps);
-      this.plen = -1;
-    }
-    return { c: out };
-  }
-
-  async encData(data) {
-    let pf = new Uint8Array(0);
-    if (!this.enc) {
-      const salt = crypto.getRandomValues(new Uint8Array(I.iv));
-      this.enc = new AEAD(cat(this.mk, salt).slice(0, I.k));
-      await this.enc.init();
-      pf = salt;
-    }
-    const mx = MODES[currentMode].maxChunk;
-    const cks = [];
-    for (let i = 0; i < data.length; i += mx) {
-      const ck = data.subarray(i, Math.min(i + mx, data.length));
-      const lb = new Uint8Array(2);
-      put16(lb, 0, ck.length);
-      cks.push(await this.enc.enc(lb));
-      cks.push(await this.enc.enc(ck));
-    }
-    return cat(pf, ...cks);
-  }
-}
-
-const handleWS = async ws => {
-  const ss = new SS();
-  await ss.init();
-  let tcp = null, writer = null, connected = false;
-
-  const close = () => {
-    writer?.releaseLock().catch(() => {});
-    tcp?.close().catch(() => {});
-    ws.close().catch(() => {});
+const xudpResp = (host, port, payload) => { const a = encodeAddr(host), ml = 7 + a.length, buf = new Uint8Array(2 + ml + 2 + payload.length); [buf[0], buf[1], buf[4], buf[5], buf[6], buf[7], buf[8]] = [ml >> 8, ml & 0xff, 2, 1, 2, port >> 8, port & 0xff]; buf.set(a, 9); const pOff = 2 + ml; [buf[pOff], buf[pOff + 1]] = [payload.length >> 8, payload.length & 0xff]; buf.set(payload, pOff + 2); return buf; };
+const turnConn = async ({ host, port, user, pass }, targetIp, targetPort) => {
+  let ctrl = null, data = null;
+  const close = () => safeClose(ctrl, data);
+  try {
+    ctrl = await dial(host, port);
+    const cw = ctrl.writable.getWriter(), cr = ctrl.readable.getReader();
+    const peer = stunAttr(AT.PEER, xorPeer(targetIp, targetPort));
+    const auth = await turnAuth(cw, cr, 6, { user, pass }, (aa, sign) => [sign(stunMsg(MT.PQ, tid(), [peer, ...aa])), sign(stunMsg(MT.CQ, tid(), [peer, ...aa]))]);
+    if (!auth) { close(); return null; }
+    const { aa, sign } = auth; let ex = auth.ex;
+    data = connect({ hostname: host, port });
+    let r; [r, ex] = await readStun(cr, ex); if (r?.type !== MT.PO) { close(); return null; }
+    [r, ex] = await readStun(cr, ex); if (r?.type !== MT.CO || !r.attrs[AT.CONNID]) { close(); return null; }
+    await data.opened; const dw = data.writable.getWriter(), dr = data.readable.getReader();
+    await dw.write(await sign(stunMsg(MT.BQ, tid(), [stunAttr(AT.CONNID, r.attrs[AT.CONNID]), ...aa])));
+    let extra; [r, extra] = await readStun(dr); if (r?.type !== MT.BO) { close(); return null; }
+    cr.releaseLock(); cw.releaseLock(); dw.releaseLock();
+    const readable = new ReadableStream({ start: c => extra?.length && c.enqueue(extra), pull: c => dr.read().then(({ done, value }) => done ? c.close() : c.enqueue(new Uint8Array(value))), cancel: () => dr.cancel() });
+    return { readable, writable: data.writable, close };
+  } catch { close(); return null; }
+};
+const turnUDP = async ({ host, port, user, pass }, sendWs) => {
+  let sock = null, closed = false;
+  const perms = new Set(), sess = new Map(), reverse = {};
+  const close = () => { closed = true; safeClose(sock); };
+  try {
+    sock = await dial(host, port);
+    const w = sock.writable.getWriter(), r = sock.readable.getReader();
+    const auth = await turnAuth(w, r, 17, { user, pass }); if (!auth) { close(); return null; }
+    const { aa, sign } = auth; let buf = auth.ex;
+    (async () => { while (!closed) { const [m, nx] = await readStun(r, buf); buf = nx; if (!m) break; if (m.type === MT.DI && m.attrs[AT.PEER] && m.attrs[AT.DATA]) { const [ip, pt] = parseXorPeer(m.attrs[AT.PEER]), s = reverse[`${ip}:${pt}`]; sendWs(xudpResp(s?.host ?? ip, s?.port ?? pt, m.attrs[AT.DATA])); } } })();
+    const ensurePerm = ip => { if (perms.has(ip)) return; perms.add(ip); sign(stunMsg(MT.PQ, tid(), [stunAttr(AT.PEER, xorPeer(ip, 0)), ...aa])).then(m => w.write(m)); };
+    const sendUDP = (ip, port, data) => w.write(stunMsg(MT.SI, tid(), [stunAttr(AT.PEER, xorPeer(ip, port)), stunAttr(AT.DATA, data)]));
+    const getIP = (h, p) => {
+      const k = `${h}:${p}`, c = sess.get(k); if (c) return c.ip;
+      const ft = fakeIPType(h); if (ft) for (const s of sess.values()) if (s.port === p && s.isV6 === (ft === 6)) { const ns = { ip: s.ip, host: h, port: p, isV6: s.isV6 }; sess.set(k, ns); reverse[`${s.ip}:${p}`] = ns; return s.ip; }
+      return null;
+    };
+    const resolveAsync = async (h, p, k) => { const ip = await resolveIP(h); if (ip) { const s = { ip, host: h, port: p, isV6: ip.includes(':') }; sess.set(k, s); reverse[`${ip}:${p}`] = s; } };
+    const processXUDP = data => { while (data.length >= 6) { const f = parseXUDP(data); if (!f) break; if (f.network === 2 && f.payload?.length && f.host) { const k = `${f.host}:${f.port}`, ip = getIP(f.host, f.port); ip ? (ensurePerm(ip), sendUDP(ip, f.port, f.payload)) : sess.has(k) || resolveAsync(f.host, f.port, k); } data = data.subarray(f.totalLen); } };
+    return { processXUDP, close };
+  } catch { close(); return null; }
+};
+const ws = async req => {
+  const [client, server] = Object.values(new WebSocketPair()); server.accept();
+  const ed = req.headers.get('sec-websocket-protocol'), turn = getTurn(req.url);
+  let w = null, sock = null, udp = null, chain = Promise.resolve();
+  const close = () => { udp?.close(); safeClose(sock, server); }, send = d => { try { server.send(d); } catch {} };
+  const process = async chunk => {
+    if (w) return w.write(chunk);
+    if (udp) return udp.processXUDP(chunk);
+    const ack = () => send(new Uint8Array([chunk[0], 0])), u = vlessUDP(chunk);
+    if (u && turn) { ack(); udp = await turnUDP(turn, send); if (!udp) return close(); const ud = chunk.subarray(u.dataOffset); ud.length && udp.processXUDP(ud); return; }
+    const v = vless(chunk); if (!v) return close(); ack();
+    const { addrType, addrBytes, dataOffset, port } = v, host = addr(addrType, addrBytes), payload = chunk.subarray(dataOffset);
+    if (turn) { const ip = addrType === 1 ? host : await resolveIP(host); if (!ip) return close(); sock = await turnConn(turn, ip, port).catch(() => null); if (!sock) return close(); }
+    else { try { sock = await dial(host, port); } catch { return close(); } }
+    w = sock.writable.getWriter(); payload.byteLength && await w.write(payload); relay(sock.readable.getReader(), send, close);
   };
-
-  ws.addEventListener('message', async e => {
-    try {
-      const { c, e: err } = await ss.decData(new Uint8Array(e.data));
-      if (err) return close();
-
-      for (const ck of c) {
-        if (!connected) {
-          connected = true;
-          const a = parseAddr(ck);
-          if (!a) return close();
-
-          const connectHost = proxyIP || a.h;
-          tcp = connect({ hostname: connectHost, port: a.p });
-          writer = tcp.writable.getWriter();
-
-          const first = ck.slice(a.o);
-          if (first.length) await writer.write(first);
-
-          (async () => {
-            try {
-              const reader = tcp.readable.getReader();
-              while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                if (value?.length) ws.send(await ss.encData(value));
-              }
-            } catch {}
-            close();
-          })();
-        } else if (writer) {
-          await writer.write(ck);
-        }
-      }
-    } catch { close(); }
-  });
-
-  ws.addEventListener('close', close);
-  ws.addEventListener('error', close);
-};
-
-export default {
-  async fetch(req, env) {
-    const url = new URL(req.url);
-    const path = url.pathname.toLowerCase();
-
-    // ==================== 路径选择逻辑 ====================
-    if (path === '/max' || path === '/maximum') {
-      currentMode = 'max';
-    } else if (path === '/daily' || path === '/') {
-      currentMode = 'daily';
-    }
-
-    // 通过路径设置指定 ProxyIP
-    if (path.startsWith('/proxy/')) {
-      const ip = path.slice(7).trim();
-      if (ip === 'clear' || ip === '') {
-        proxyIP = '';
-      } else {
-        proxyIP = ip;
-      }
-    }
-    // =====================================================
-
-    // 环境变量或查询参数优先级更高
-    if (env.MODE) currentMode = env.MODE.toLowerCase();
-    if (url.searchParams.get('mode')) currentMode = url.searchParams.get('mode').toLowerCase();
-
-    if (!MODES[currentMode]) currentMode = 'daily';
-
-    // 设置 ProxyIP
-    if (env.PROXYIP || env.proxyIP) {
-      proxyIP = env.PROXYIP || env.proxyIP;
-    } else if (proxyIP === '' && MODES[currentMode].useRandomIP && proxyIPs.length > 0) {
-      proxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
-    } else if (proxyIP === '' && !MODES[currentMode].useRandomIP && proxyIPs.length > 0) {
-      proxyIP = proxyIPs[0];
-    }
-
-    const up = req.headers.get('Upgrade');
-    if (up === 'websocket') {
-      const pair = new WebSocketPair();
-      const [client, server] = Object.values(pair);
-      server.accept();
-      handleWS(server);
-      return new Response(null, { status: 101, webSocket: client });
-    }
-
-    // 状态页面显示
-    return new Response(
-`Shadowsocks Worker Running
-
-当前模式: ${MODES[currentMode].name}
-分包大小: ${MODES[currentMode].maxChunk} 字节
-ProxyIP: ${proxyIP || '直连'}
-
-使用方法：
-/          → 日常模式
-/max       → 最大模式
-/proxy/1.2.3.4 → 设置指定IP
-/proxy/clear   → 清除ProxyIP
-?mode=max  → 查询参数切换
-`,
-      {
-        status: 200,
-        headers: { 'content-type': 'text/plain;charset=utf-8' }
-      }
-    );
-  }
+  if (ed?.length <= maxED) chain = chain.then(() => process(Uint8Array.fromBase64(ed, { alphabet: 'base64url' }))).catch(close);
+  server.addEventListener('message', e => { chain = chain.then(() => process(new Uint8Array(e.data instanceof ArrayBuffer ? e.data : e.data.buffer ?? e.data))).catch(close); });
+  server.addEventListener('close', close); server.addEventListener('error', close);
+  return new Response(null, { status: 101, webSocket: client, headers: ed ? { 'sec-websocket-protocol': ed } : {} });
 };
