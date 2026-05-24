@@ -27,7 +27,7 @@ const proxyIPs = [
 ];
 
 let currentMode = 'daily';
-let proxyIP = '';
+let proxyIP = 'ProxyIP.HK.CMLiussss.net';
 // =====================================================
 
 const C = {
